@@ -1,0 +1,517 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Audio Processing via FFT (WASM)</title>
+    <style>
+        body { font-family: sans-serif; margin: 2em; max-width: 800px; }
+        .control-group { margin: 1.5em 0; padding: 1em; border: 1px solid #ccc; border-radius: 8px; }
+        .control-row { margin: 0.8em 0; display: flex; align-items: center; gap: 1em; flex-wrap: wrap; }
+        label { display: inline-block; min-width: 150px; }
+        input[type="number"] { width: 120px; padding: 4px; }
+        audio { display: block; margin: 1em 0; width: 100%; }
+        .hidden { display: none; }
+        button { padding: 10px 20px; font-size: 1.1em; }
+        .note { color: #666; font-size: 0.9em; }
+        .progress-area { margin: 1em 0; padding: 1em; background: #f5f5f5; border-radius: 8px; }
+        .progress-row { margin: 0.5em 0; display: flex; align-items: center; gap: 1em; }
+        progress { width: 300px; height: 20px; }
+    </style>
+    <script src="fft_processor.js"></script>
+</head>
+<body>
+    <h1>Audio Processing via FFT (WASM)</h1>
+    <input type="file" id="audioFile" accept="audio/*">
+
+    <div class="control-group">
+        <h3>Time cropping</h3>
+        <div class="control-row">
+            <label>Start (sec): <input type="number" id="startTime" value="0" min="0" step="0.1"></label>
+            <label>End (sec): <input type="number" id="endTime" value="0" min="0" step="0.1"></label>
+            <span class="note">(0 = until end of file)</span>
+        </div>
+    </div>
+
+    <div class="control-group">
+        <h3>Spectrum modifications</h3>
+        <div class="control-row">
+            <label><input type="checkbox" id="cropSpectrum"> Crop spectrum (use k_min/k_max)</label>
+        </div>
+        <div class="control-row">
+            <label>k_min (index): <input type="number" id="kMin" value="0" min="0"></label>
+            <label>k_max (index): <input type="number" id="kMax" value="-1" min="-1"></label>
+            <span class="note">(use -1 for no upper limit)</span>
+        </div>
+        <div class="control-row">
+            <label><input type="checkbox" id="removePhase"> Remove phase (magnitudes only)</label>
+        </div>
+    </div>
+
+    <div class="control-group">
+        <h3>Windowed mode (STFT)</h3>
+        <div class="control-row">
+            <label><input type="checkbox" id="stftEnable"> Use windowed processing</label>
+        </div>
+        <div id="stftParams" class="hidden">
+            <div class="control-row">
+                <label>Window length (sec): <input type="number" id="windowTime" value="0.1" min="0.01" max="2" step="0.01"></label>
+                <span class="note">(will be rounded to next power of two)</span>
+            </div>
+            <div class="control-row">
+                <label>Overlap (%): <input type="number" id="overlap" value="50" min="0" max="95" step="5"></label>
+            </div>
+            <div class="control-row">
+                <label>Window function:</label>
+                <select id="windowFunc">
+                    <option value="rect">Rectangular</option>
+                    <option value="hann" selected>Hann</option>
+                </select>
+            </div>
+        </div>
+    </div>
+
+    <div class="control-group">
+        <h3>Extra</h3>
+        <div class="control-row">
+            <label><input type="checkbox" id="keepFullLength" checked> Keep full length (do not truncate tail)</label>
+            <span class="note">(if off, signal is cropped to original length, may lose energy)</span>
+        </div>
+    </div>
+
+    <button id="processBtn" disabled>Load a file and wait for WASM initialization</button>
+
+    <div class="progress-area" id="progressArea" style="display: none;">
+        <div class="progress-row"><span>Decoding:</span><progress id="decodeProgress" value="0" max="100"></progress></div>
+        <div class="progress-row"><span>FFT:</span><progress id="fftProgress" value="0" max="100"></progress></div>
+        <div class="progress-row"><span>WAV assembly:</span><progress id="wavProgress" value="0" max="100"></progress></div>
+        <div id="progressMessage" class="note"></div>
+    </div>
+
+    <h3>Original (cropped fragment)</h3>
+    <audio id="originalPlayer" controls></audio>
+    <h3>Processed signal</h3>
+    <audio id="processedPlayer" controls></audio><br>
+    <a id="downloadLink" download="processed.wav">Download WAV</a>
+
+    <script>
+        (function() {
+            const originalPlayer = document.getElementById('originalPlayer');
+            const processedPlayer = document.getElementById('processedPlayer');
+            const downloadLink = document.getElementById('downloadLink');
+            const audioFileInput = document.getElementById('audioFile');
+            const startTimeInput = document.getElementById('startTime');
+            const endTimeInput = document.getElementById('endTime');
+            const kMinInput = document.getElementById('kMin');
+            const kMaxInput = document.getElementById('kMax');
+            const removePhaseCheck = document.getElementById('removePhase');
+            const cropSpectrumCheck = document.getElementById('cropSpectrum');
+            const stftEnable = document.getElementById('stftEnable');
+            const stftParams = document.getElementById('stftParams');
+            const windowTimeInput = document.getElementById('windowTime');
+            const overlapInput = document.getElementById('overlap');
+            const windowFuncSelect = document.getElementById('windowFunc');
+            const keepFullLengthCheck = document.getElementById('keepFullLength');
+            const progressArea = document.getElementById('progressArea');
+            const decodeProgress = document.getElementById('decodeProgress');
+            const fftProgress = document.getElementById('fftProgress');
+            const wavProgress = document.getElementById('wavProgress');
+            const progressMessage = document.getElementById('progressMessage');
+            const processBtn = document.getElementById('processBtn');
+
+            let audioContext = null;
+            let originalBuffer = null;
+            let sampleRate = 44100;
+            let totalDuration = 0;
+            let Module = null;
+
+            stftEnable.addEventListener('change', function(e) {
+                if (e.target.checked) stftParams.classList.remove('hidden');
+                else stftParams.classList.add('hidden');
+            });
+
+            (async function initWasm() {
+                try {
+                    Module = await createFFTModule();
+                    console.log('WASM module loaded', Module);
+                    processBtn.disabled = false;
+                    processBtn.textContent = 'Process';
+                } catch (err) {
+                    console.error('Failed to load WASM module', err);
+                    alert('Error loading WASM module: ' + err);
+                }
+            })();
+
+            audioFileInput.addEventListener('change', async function(e) {
+                const file = e.target.files[0];
+                if (!file) return;
+
+                if (originalPlayer.src) URL.revokeObjectURL(originalPlayer.src);
+                originalPlayer.src = URL.createObjectURL(file);
+
+                progressArea.style.display = 'block';
+                decodeProgress.value = '';
+                fftProgress.value = 0;
+                wavProgress.value = 0;
+                progressMessage.textContent = 'Decoding...';
+
+                try {
+                    const arrayBuffer = await file.arrayBuffer();
+                    const ctx = audioContext || (audioContext = new AudioContext());
+                    originalBuffer = await ctx.decodeAudioData(arrayBuffer);
+                    sampleRate = originalBuffer.sampleRate;
+                    totalDuration = originalBuffer.duration;
+
+                    const maxFreqIndex = Math.floor(originalBuffer.length / 2);
+                    kMaxInput.max = maxFreqIndex;
+                    kMaxInput.value = Math.min(1000, maxFreqIndex);
+                    kMinInput.max = maxFreqIndex;
+                    endTimeInput.max = totalDuration;
+                    endTimeInput.value = totalDuration;
+
+                    decodeProgress.value = 100;
+                    progressMessage.textContent = 'Decoding complete.';
+                } catch (err) {
+                    alert('Decoding error: ' + err);
+                    progressArea.style.display = 'none';
+                }
+            });
+
+            processBtn.addEventListener('click', async function() {
+                if (!Module) {
+                    alert('WASM module not loaded yet');
+                    return;
+                }
+                if (!originalBuffer) {
+                    alert('Please load an audio file first');
+                    return;
+                }
+
+                processBtn.disabled = true;
+                progressArea.style.display = 'block';
+                decodeProgress.value = 100;
+                fftProgress.value = 0;
+                wavProgress.value = 0;
+                progressMessage.textContent = 'Preparing...';
+
+                try {
+                    const rawKMin = parseInt(kMinInput.value, 10) || 0;
+                    let rawKMax = parseInt(kMaxInput.value, 10);
+                    if (isNaN(rawKMax)) rawKMax = 1000; // default
+                    const removePhase = removePhaseCheck.checked;
+                    const cropSpectrum = cropSpectrumCheck.checked;
+                    const useStft = stftEnable.checked;
+                    const keepFullLength = keepFullLengthCheck.checked;
+
+                    let startSec = parseFloat(startTimeInput.value) || 0;
+                    let endSec = parseFloat(endTimeInput.value) || totalDuration;
+                    if (endSec <= startSec) endSec = totalDuration;
+                    if (startSec < 0) startSec = 0;
+                    if (endSec > totalDuration) endSec = totalDuration;
+
+                    const channelData = originalBuffer.getChannelData(0);
+                    const startSample = Math.floor(startSec * sampleRate);
+                    const endSample = Math.min(Math.floor(endSec * sampleRate), channelData.length);
+                    const fragment = channelData.slice(startSample, endSample);
+
+                    const origBlob = createWavFromSamples(fragment, sampleRate);
+                    originalPlayer.src = URL.createObjectURL(origBlob);
+
+                    let processed;
+                    if (useStft) {
+                        const windowTime = parseFloat(windowTimeInput.value) || 0.1;
+                        const overlap = parseFloat(overlapInput.value) || 50;
+                        const winFunc = windowFuncSelect.value;
+                        const result = await processSTFT(
+                            Module, fragment, sampleRate,
+                            windowTime, overlap, winFunc,
+                            rawKMin, rawKMax, removePhase, cropSpectrum,
+                            (p) => { fftProgress.value = p * 100; progressMessage.textContent = `STFT: ${Math.round(p*100)}%`; }
+                        );
+                        processed = result;
+                    } else {
+                        const result = await processFull(
+                            Module, fragment,
+                            rawKMin, rawKMax, removePhase, cropSpectrum, keepFullLength,
+                            () => { fftProgress.value = ''; progressMessage.textContent = 'Full FFT...'; }
+                        );
+                        processed = result.processed;
+                    }
+
+                    let hasNaN = false, hasInf = false;
+                    for (let i = 0; i < processed.length; i++) {
+                        if (isNaN(processed[i])) { hasNaN = true; break; }
+                        if (!isFinite(processed[i])) { hasInf = true; break; }
+                    }
+                    if (hasNaN) console.error('NaN in processed samples');
+                    if (hasInf) console.error('Inf in processed samples');
+
+                    let maxBeforeNorm = 0;
+                    for (let i = 0; i < processed.length; i++) {
+                        maxBeforeNorm = Math.max(maxBeforeNorm, Math.abs(processed[i]));
+                    }
+                    console.log('Max before normalization:', maxBeforeNorm);
+
+                    if (maxBeforeNorm < 1e-10) {
+                        console.warn('Signal near zero before normalization!');
+                    } else {
+                        normalizeSamples(processed);
+                        let maxAfterNorm = 0;
+                        for (let i = 0; i < processed.length; i++) {
+                            maxAfterNorm = Math.max(maxAfterNorm, Math.abs(processed[i]));
+                        }
+                        console.log('Max after normalization:', maxAfterNorm);
+                    }
+
+                    wavProgress.value = 50;
+                    progressMessage.textContent = 'Assembling WAV...';
+                    const wavBlob = createWavFromSamples(processed, sampleRate);
+                    const procUrl = URL.createObjectURL(wavBlob);
+
+                    try {
+                        const arrayBuffer = await wavBlob.arrayBuffer();
+                        console.log('WAV blob size:', wavBlob.size);
+                        const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+                        await audioCtx.decodeAudioData(arrayBuffer);
+                        console.log('✅ WAV successfully decoded');
+                    } catch (e) {
+                        console.error('❌ WAV decode error:', e);
+                    }
+
+                    processedPlayer.src = procUrl;
+                    downloadLink.href = procUrl;
+                    wavProgress.value = 100;
+                    progressMessage.textContent = 'Done!';
+                } catch (err) {
+                    console.error(err);
+                    alert('Error: ' + err);
+                } finally {
+                    processBtn.disabled = false;
+                }
+            });
+
+            function processFull(Module, samples, rawKMin, rawKMax, removePhase, cropSpectrum, keepFullLength, startCb) {
+                return new Promise(resolve => {
+                    setTimeout(() => {
+                        startCb();
+                        const N = 1 << Math.ceil(Math.log2(samples.length));
+                        // Handle special value -1 for k_max
+                        const effKMax = (cropSpectrum && rawKMax !== -1) ? rawKMax : (N - 1);
+                        const effKMin = cropSpectrum ? rawKMin : 0;
+
+                        const realPtr = Module._malloc(N * 4);
+                        const imagPtr = Module._malloc(N * 4);
+
+                        const realArray = new Float32Array(N);
+                        realArray.set(samples);
+                        Module.HEAPF32.set(realArray, realPtr >> 2);
+                        Module.HEAPF32.fill(0, imagPtr >> 2, (imagPtr >> 2) + N);
+
+                        Module._forward_fft(realPtr, imagPtr, N);
+
+                        const realSpectBefore = new Float32Array(Module.HEAPF32.buffer, realPtr, N);
+                        const imagSpectBefore = new Float32Array(Module.HEAPF32.buffer, imagPtr, N);
+                        let energyBefore = 0;
+                        for (let i = 0; i < N; i++) {
+                            energyBefore += realSpectBefore[i]*realSpectBefore[i] + imagSpectBefore[i]*imagSpectBefore[i];
+                        }
+
+                        Module._modify_spectrum(realPtr, imagPtr, N, effKMin, effKMax, removePhase ? 1 : 0);
+
+                        const realSpectAfter = new Float32Array(Module.HEAPF32.buffer, realPtr, N);
+                        const imagSpectAfter = new Float32Array(Module.HEAPF32.buffer, imagPtr, N);
+                        let energyAfter = 0;
+                        for (let i = 0; i < N; i++) {
+                            energyAfter += realSpectAfter[i]*realSpectAfter[i] + imagSpectAfter[i]*imagSpectAfter[i];
+                        }
+                        console.log(`Spectrum energy before: ${energyBefore.toExponential(5)}`);
+                        console.log(`Spectrum energy after: ${energyAfter.toExponential(5)}`);
+                        console.log(`Spectrum energy ratio: ${(energyAfter/energyBefore).toFixed(3)}`);
+
+                        Module._inverse_fft(realPtr, imagPtr, N);
+
+                        const imagResult = new Float32Array(Module.HEAPF32.buffer, imagPtr, N);
+                        let maxImag = 0;
+                        for (let i = 0; i < N; i++) {
+                            maxImag = Math.max(maxImag, Math.abs(imagResult[i]));
+                        }
+                        console.log(`Max imaginary part after inverse FFT: ${maxImag.toExponential(5)}`);
+
+                        const resultArrayFull = new Float32Array(Module.HEAPF32.buffer, realPtr, N);
+
+                        let energyProcFull = 0;
+                        for (let i = 0; i < N; i++) {
+                            energyProcFull += resultArrayFull[i] * resultArrayFull[i];
+                        }
+                        console.log(`Energy processed (full length): ${energyProcFull.toExponential(5)}`);
+
+                        let energyOrig = 0;
+                        for (let i = 0; i < samples.length; i++) {
+                            energyOrig += samples[i] * samples[i];
+                        }
+                        console.log(`Energy original: ${energyOrig.toExponential(5)}`);
+                        console.log(`Energy ratio (full length / original): ${(energyProcFull/energyOrig).toFixed(3)}`);
+
+                        let resultArray;
+                        if (keepFullLength) {
+                            resultArray = resultArrayFull.slice();
+                        } else {
+                            resultArray = resultArrayFull.slice(0, samples.length);
+                        }
+
+                        Module._free(realPtr);
+                        Module._free(imagPtr);
+
+                        normalizeSamples(resultArray);
+
+                        resolve({
+                            processed: resultArray,
+                            fullLength: resultArrayFull
+                        });
+                    }, 0);
+                });
+            }
+
+            function processSTFT(Module, samples, sampleRate, windowTime, overlapPercent, winType,
+                                  rawKMin, rawKMax, removePhase, cropSpectrum, progressCb) {
+                return new Promise(resolve => {
+                    const mod = Module;
+                    setTimeout(() => {
+                        let windowSize = Math.round(windowTime * sampleRate);
+                        windowSize = Math.max(2, 1 << Math.ceil(Math.log2(windowSize)));
+                        let hop = Math.round(windowSize * (1 - overlapPercent / 100));
+                        if (hop < 1) hop = 1;
+
+                        const N = samples.length;
+                        let numWindows = Math.floor((N - windowSize) / hop) + 1;
+                        if (numWindows <= 0) {
+                            processFull(mod, samples, rawKMin, rawKMax, removePhase, cropSpectrum, false, () => {}).then(res => resolve(res.processed));
+                            return;
+                        }
+
+                        if (numWindows > 500 && !confirm(`Windows: ${numWindows}. Continue?`)) {
+                            resolve(samples);
+                            return;
+                        }
+
+                        const win = getWindow(winType, windowSize);
+                        const out = new Float32Array(hop * (numWindows - 1) + windowSize);
+                        const weight = new Float32Array(out.length);
+
+                        let idx = 0;
+                        function next() {
+                            if (idx >= numWindows) {
+                                for (let i = 0; i < out.length; i++) {
+                                    if (weight[i] > 1e-10) out[i] /= weight[i];
+                                }
+                                const result = out.slice(0, N);
+                                normalizeSamples(result);
+                                resolve(result);
+                                return;
+                            }
+
+                            progressCb(idx / numWindows);
+                            const start = idx * hop;
+                            const effKMax = (cropSpectrum && rawKMax !== -1) ? rawKMax : (windowSize - 1);
+                            const effKMin = cropSpectrum ? rawKMin : 0;
+
+                            const realPtr = mod._malloc(windowSize * 4);
+                            const imagPtr = mod._malloc(windowSize * 4);
+
+                            const windowed = new Float32Array(windowSize);
+                            for (let i = 0; i < windowSize; i++) {
+                                const s = start + i;
+                                windowed[i] = s < N ? samples[s] * win[i] : 0;
+                            }
+                            mod.HEAPF32.set(windowed, realPtr >> 2);
+                            mod.HEAPF32.fill(0, imagPtr >> 2, (imagPtr >> 2) + windowSize);
+
+                            mod._forward_fft(realPtr, imagPtr, windowSize);
+                            mod._modify_spectrum(realPtr, imagPtr, windowSize, effKMin, effKMax, removePhase ? 1 : 0);
+                            mod._inverse_fft(realPtr, imagPtr, windowSize);
+
+                            const rec = new Float32Array(mod.HEAPF32.buffer, realPtr, windowSize);
+                            for (let i = 0; i < windowSize; i++) {
+                                const pos = start + i;
+                                const val = rec[i] * win[i];
+                                out[pos] += val;
+                                weight[pos] += win[i] * win[i];
+                            }
+
+                            mod._free(realPtr);
+                            mod._free(imagPtr);
+
+                            idx++;
+                            setTimeout(next, 0);
+                        }
+
+                        next();
+                    }, 0);
+                });
+            }
+
+            function getWindow(type, N) {
+                const w = new Float32Array(N);
+                if (type === 'hann') {
+                    for (let i = 0; i < N; i++) {
+                        w[i] = 0.5 * (1 - Math.cos(2 * Math.PI * i / (N - 1)));
+                    }
+                } else {
+                    for (let i = 0; i < N; i++) w[i] = 1;
+                }
+                return w;
+            }
+
+            function normalizeSamples(arr) {
+                let max = 0;
+                for (let i = 0; i < arr.length; i++) {
+                    const a = Math.abs(arr[i]);
+                    if (a > max) max = a;
+                }
+                if (max > 1e-10) {
+                    for (let i = 0; i < arr.length; i++) arr[i] /= max;
+                } else {
+                    console.warn('Max too small, normalization skipped');
+                }
+            }
+
+            function createWavFromSamples(samples, sr) {
+                const len = samples.length;
+                if (len === 0) throw new Error('No samples to create WAV');
+                
+                const data = new Int16Array(len);
+                for (let i = 0; i < len; i++) {
+                    let s = samples[i];
+                    if (s > 1.0) s = 1.0;
+                    if (s < -1.0) s = -1.0;
+                    data[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+                }
+
+                const buf = new ArrayBuffer(44);
+                const view = new DataView(buf);
+                let p = 0;
+                writeString(view, p, 'RIFF'); p += 4;
+                view.setUint32(p, 36 + len * 2, true); p += 4;
+                writeString(view, p, 'WAVE'); p += 4;
+                writeString(view, p, 'fmt '); p += 4;
+                view.setUint32(p, 16, true); p += 4;
+                view.setUint16(p, 1, true); p += 2;
+                view.setUint16(p, 1, true); p += 2;
+                view.setUint32(p, sr, true); p += 4;
+                view.setUint32(p, sr * 2, true); p += 4;
+                view.setUint16(p, 2, true); p += 2;
+                view.setUint16(p, 16, true); p += 2;
+                writeString(view, p, 'data'); p += 4;
+                view.setUint32(p, len * 2, true); p += 4;
+
+                return new Blob([buf, data.buffer], { type: 'audio/wav' });
+            }
+
+            function writeString(view, offset, str) {
+                for (let i = 0; i < str.length; i++) {
+                    view.setUint8(offset + i, str.charCodeAt(i));
+                }
+            }
+        })();
+    </script>
+</body>
+</html>
